@@ -1,4 +1,6 @@
 import { createHash } from 'crypto';
+import { LRUCache } from 'lru-cache';
+import { envInt } from '../../utils/envNumber';
 
 const PACKED = 0xa1;
 const HASHED = 0xb2;
@@ -7,7 +9,7 @@ const NONE16 = 0xffff;
 const MAX48 = 2 ** 48 - 1;
 
 export type PackableKind = 'movie' | 'series' | 'season' | 'episode';
-export type HashedKind = 'view' | 'genre' | 'person' | 'studio' | 'collection' | 'boxset' | 'marker';
+export type HashedKind = 'view' | 'genre' | 'person' | 'studio' | 'collection' | 'boxset' | 'marker' | 'playlist' | 'playlists';
 export type JellyfinKind = PackableKind | HashedKind;
 
 export type Descriptor =
@@ -16,12 +18,16 @@ export type Descriptor =
   | { k: 'episode'; t: string; i: string; s: number | null; e: number }
   | { k: 'view'; t: string; c: string }
   | { k: 'genre'; t: string; c: string; g: string }
-  | { k: 'person' | 'studio'; n: string }
+  | { k: 'studio'; n: string }
+  | { k: 'person'; n: string; s?: 'tmdb' | 'tvdb'; x?: number }
   /** A collection built in the configuration, and one folder tile inside it. */
   | { k: 'collection'; c: string }
   | { k: 'boxset'; c: string; f: string }
   /** The picker entry that resolves an item's versions when chosen. */
-  | { k: 'marker'; i: string };
+  | { k: 'marker'; i: string }
+  /** A user's playlist, and the folder that lists them. */
+  | { k: 'playlist'; p: string }
+  | { k: 'playlists' };
 
 const KIND_CODES: Record<PackableKind, number> = {
   movie: 1,
@@ -250,14 +256,19 @@ export function canonicalDescriptor(d: Descriptor): string {
     case 'episode':
       return `episode|${d.t}|${d.i}|${d.s === null ? '' : d.s}|${d.e}`;
     case 'person':
+      return d.s && d.x ? `person|${d.n}|${d.s}|${d.x}` : `person|${d.n}`;
     case 'studio':
-      return `${d.k}|${d.n}`;
+      return `studio|${d.n}`;
     case 'collection':
       return `collection|${d.c}`;
     case 'boxset':
       return `boxset|${d.c}|${d.f}`;
     case 'marker':
       return `marker|${d.i}`;
+    case 'playlist':
+      return `playlist|${d.p}`;
+    case 'playlists':
+      return 'playlists';
   }
 }
 
@@ -290,10 +301,17 @@ export function unpackJellyfinId(raw: string): Descriptor | null {
   return tryUnpack(id);
 }
 
+const hashedIds = new LRUCache<string, string>({ max: envInt('JELLYFIN_ID_CACHE_MAX', 100000, 1) });
+
 export function hashJellyfinId(d: Descriptor): string {
-  const hash = createHash('md5').update(canonicalDescriptor(d)).digest();
+  const canonical = canonicalDescriptor(d);
+  const held = hashedIds.get(canonical);
+  if (held) return held;
+  const hash = createHash('md5').update(canonical).digest();
   hash[0] = HASHED;
-  return hash.toString('hex');
+  const id = hash.toString('hex');
+  hashedIds.set(canonical, id);
+  return id;
 }
 
 export function isHashedJellyfinId(id: string): boolean {

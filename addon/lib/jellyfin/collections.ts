@@ -3,11 +3,13 @@ import { LRUCache } from 'lru-cache';
 import { envInt } from '../../utils/envNumber';
 import { encodeJellyfinId } from './ids';
 import { collectionFolder, EMPTY_USER_DATA } from './dto';
-import { fetchWindow, includeTypesFilter, isLandscapeCatalog, knownCatalogLength, metaToBaseItem, rememberImages, showLandscape } from './items';
-import { getCatalogs, type CatalogRef } from './views';
-import { viewerAccountOwner } from './viewer';
+import { catalogCannotServe, fetchWindow, includeTypesFilter, listFilterKey, isLandscapeCatalog, knownCatalogLength, knownPageLength, metaToBaseItem, rememberImages, servedOrder, showLandscape, warmCatalogLengths } from './items';
+import { getCatalogs, requiresGenre, viewIdFor, viewTypeFor, type CatalogRef } from './views';
+import { viewerAccountOwner, viewerReadsExtensions } from './viewer';
 import { profileTags } from './profiles';
 import { findFolder, subFolders, type CollectionDraft, type FolderDraft, type SourceDraft } from '../collectionBuilder/types';
+import { FOLDER_MERGE_MODE, mergeModeOf, type MergeMode } from '../collectionBuilder/mergeModes';
+import { shuffleMetas } from '../../utils/mergedCatalog';
 
 // A builder collection is a library of box sets; a folder is one box set whose sources are its members.
 
@@ -15,6 +17,10 @@ const IMAGE_URL = /^https?:\/\//i;
 
 export function imageOf(value: unknown): string | undefined {
   return typeof value === 'string' && IMAGE_URL.test(value.trim()) ? value.trim() : undefined;
+}
+
+export function animatedPosterOf(folder: FolderDraft): string | undefined {
+  return folder.focusGifEnabled !== false ? imageOf(folder.focusGifUrl) : undefined;
 }
 
 /** An entry with tags is for the users holding one of them; the unrestricted user sees every entry. */
@@ -85,11 +91,67 @@ function visibleDeep(catalogs: CatalogRef[], folder: FolderDraft): number {
   return visibleSources(catalogs, folder).length + subFolders(folder).reduce((sum, child) => sum + visibleDeep(catalogs, child), 0);
 }
 
-function boxSetItem(serverId: string, collection: CollectionDraft, folder: FolderDraft, sourceCount: number, parentId: string): any {
+interface CountScope {
+  userUUID: string;
+  tags: string[];
+}
+
+// Titles are counted once a folder's one source has been read to its end; several
+// sources share titles, so their lengths add up to more than the folder shows.
+function childCount(scope: CountScope, catalogs: CatalogRef[], folder: FolderDraft): number | null {
+  const sources = visibleSources(catalogs, folder);
+  if (sources.length > 1) return null;
+  const folders = subFolders(folder).filter((child) => visibleDeep(catalogs, child) > 0).length;
+  if (sources.length === 0) return folders;
+  const { source, catalog } = sources[0];
+  const genre = pinnedGenre(source);
+  const known = knownCatalogLength(scope.userUUID, catalog, genre ? { genre } : {}, scope.tags);
+  return known === undefined ? null : folders + known;
+}
+
+async function countScope(userUUID: string, config: any, catalogs: CatalogRef[], folders: FolderDraft[]): Promise<CountScope> {
+  const tags = profileTags(config);
+  const unpinned = new Map<string, CatalogRef>();
+  const walk = (list: FolderDraft[]) => {
+    for (const folder of list) {
+      for (const { source, catalog } of visibleSources(catalogs, folder)) {
+        if (!pinnedGenre(source)) unpinned.set(`${catalog.type}|${catalog.id}`, catalog);
+      }
+      walk(subFolders(folder));
+    }
+  };
+  walk(folders);
+  await warmCatalogLengths(userUUID, [...unpinned.values()], {}, tags);
+  return { userUUID, tags };
+}
+
+function sourceRows(catalogs: CatalogRef[], folder: FolderDraft): Array<{ id: string; name: string; genre?: string; collectionType?: string }> {
+  return visibleSources(catalogs, folder).map(({ source, catalog }) => {
+    const pinned = pinnedGenre(source);
+    const name = source.name?.trim() || catalog.name;
+    const options = catalogGenres(catalog);
+    const genre = pinned ?? (requiresGenre(catalog) ? (catalogOffersNone(catalog) ? 'None' : options[0]) : undefined);
+    const collectionType = viewTypeFor(catalog);
+    return {
+      id: viewIdFor(catalog),
+      name: pinned ? `${name} · ${pinned}` : name,
+      ...(genre ? { genre } : {}),
+      ...(collectionType ? { collectionType } : {}),
+    };
+  });
+}
+
+function boxSetItem(serverId: string, catalogs: CatalogRef[], collection: CollectionDraft, folder: FolderDraft, childCount: number | null, parentId: string): any {
   const id = boxSetId(collection, folder);
   const cover = imageOf(folder.coverImageUrl);
   const backdrop = imageOf(folder.heroBackdropUrl);
   const logo = imageOf(folder.titleLogoUrl);
+  const animated = animatedPosterOf(folder);
+  const sources = viewerReadsExtensions() ? sourceRows(catalogs, folder) : [];
+  const extensions = {
+    ...(animated ? { animatedPoster: animated } : {}),
+    ...(sources.length ? { sources } : {}),
+  };
   if (cover || backdrop || logo) rememberImages(serverId, id, { primary: cover, backdrop, logo });
 
   return {
@@ -116,7 +178,7 @@ function boxSetItem(serverId: string, collection: CollectionDraft, folder: Folde
     Genres: [],
     LocalTrailerCount: 0,
     UserData: { ...EMPTY_USER_DATA, Key: id, ItemId: id },
-    ChildCount: sourceCount,
+    ChildCount: childCount,
     RecursiveItemCount: null,
     DisplayPreferencesId: id,
     Tags: folder.hideTitle ? [HIDE_TITLE_TAG] : [],
@@ -128,16 +190,17 @@ function boxSetItem(serverId: string, collection: CollectionDraft, folder: Folde
     MediaType: 'Unknown',
     LockedFields: [],
     LockData: false,
+    ...(Object.keys(extensions).length ? { aiostreams: extensions } : {}),
   };
 }
 
-function boxSetsOf(catalogs: CatalogRef[], serverId: string, collection: CollectionDraft, folders: FolderDraft[], parentId: string, deep: boolean): any[] {
+function boxSetsOf(scope: CountScope, catalogs: CatalogRef[], serverId: string, collection: CollectionDraft, folders: FolderDraft[], parentId: string, deep: boolean): any[] {
   const out: any[] = [];
   for (const folder of folders) {
     if (!folder?.id || typeof folder.title !== 'string') continue;
-    const set = boxSetItem(serverId, collection, folder, visibleDeep(catalogs, folder), parentId);
+    const set = boxSetItem(serverId, catalogs, collection, folder, childCount(scope, catalogs, folder), parentId);
     out.push(set);
-    if (deep) out.push(...boxSetsOf(catalogs, serverId, collection, subFolders(folder), set.Id, true));
+    if (deep) out.push(...boxSetsOf(scope, catalogs, serverId, collection, subFolders(folder), set.Id, true));
   }
   return out;
 }
@@ -145,17 +208,19 @@ function boxSetsOf(catalogs: CatalogRef[], serverId: string, collection: Collect
 /** The folders of a collection, including those with nothing this user can see. */
 export async function boxSetsFor(userUUID: string, config: any, serverId: string, collection: CollectionDraft): Promise<any[]> {
   const catalogs = await getCatalogs(userUUID, config);
-  return boxSetsOf(catalogs, serverId, collection, Array.isArray(collection.folders) ? collection.folders : [], collectionViewId(collection), false);
+  const folders = Array.isArray(collection.folders) ? collection.folders : [];
+  return boxSetsOf(await countScope(userUUID, config, catalogs, folders), catalogs, serverId, collection, folders, collectionViewId(collection), false);
 }
 
 export async function boxSetsUnder(userUUID: string, config: any, serverId: string, collection: CollectionDraft, folder: FolderDraft): Promise<any[]> {
   const catalogs = await getCatalogs(userUUID, config);
-  return boxSetsOf(catalogs, serverId, collection, subFolders(folder), boxSetId(collection, folder), false);
+  return boxSetsOf(await countScope(userUUID, config, catalogs, subFolders(folder)), catalogs, serverId, collection, subFolders(folder), boxSetId(collection, folder), false);
 }
 
 export async function boxSetsDeep(userUUID: string, config: any, serverId: string, collection: CollectionDraft): Promise<any[]> {
   const catalogs = await getCatalogs(userUUID, config);
-  return boxSetsOf(catalogs, serverId, collection, Array.isArray(collection.folders) ? collection.folders : [], collectionViewId(collection), true);
+  const folders = Array.isArray(collection.folders) ? collection.folders : [];
+  return boxSetsOf(await countScope(userUUID, config, catalogs, folders), catalogs, serverId, collection, folders, collectionViewId(collection), true);
 }
 
 export async function allBoxSets(userUUID: string, config: any, serverId: string): Promise<any[]> {
@@ -194,6 +259,11 @@ const memberCursors = new LRUCache<string, MemberCursor>({
   ttl: envInt('JELLYFIN_FOLDER_CURSOR_TTL', 600, 30) * 1000,
 });
 const MEMBER_CURSOR_MAX_IDS = 25000;
+
+function catalogOffersNone(catalog: CatalogRef): boolean {
+  const extra = (catalog.extra ?? []).find((e: any) => e?.name === 'genre');
+  return Array.isArray(extra?.options) && extra.options.includes('None');
+}
 
 function catalogGenres(catalog: CatalogRef): string[] {
   const extra = (catalog.extra ?? []).find((e: any) => e?.name === 'genre');
@@ -235,7 +305,8 @@ export async function boxSetMembers(
   startIndex: number,
   limit: number,
   includeItemTypes?: string,
-  genre?: string
+  genre?: string,
+  officialRatings?: string
 ): Promise<MembersPage> {
   const sources = visibleSources(await getCatalogs(userUUID, config), folder)
     .map((entry) => ({ ...entry, genre: genre ? genreFor(entry.source, entry.catalog, genre) : pinnedGenre(entry.source) }))
@@ -243,11 +314,20 @@ export async function boxSetMembers(
   const parentId = boxSetId(collection, folder);
   const tags = profileTags(config);
   const extrasOf = (entry: { genre: string | null }): Record<string, string> => (entry.genre ? { genre: entry.genre } : {});
+  const filterKey = listFilterKey(includeItemTypes, officialRatings);
 
   const cursorKey = JSON.stringify([
-    userUUID, collection.id, folder.id, includeItemTypes ?? '', genre ?? '', tags, viewerAccountOwner(),
+    userUUID, collection.id, folder.id, filterKey, genre ?? '', tags, viewerAccountOwner(),
     sources.map(({ catalog, genre: served }) => [catalog.type, catalog.id, served ?? '']),
   ]);
+  const mode = mergeModeOf(folder.mergeMode, FOLDER_MERGE_MODE);
+  if (sources.length > 1 && mode !== 'sequential') {
+    const page = await mixedMembers({
+      userUUID, config, serverId, parentId, sources, mode, startIndex, limit, includeItemTypes, officialRatings, tags, filterKey,
+      cursorKey: `${mode}:${cursorKey}`,
+    });
+    return folder.randomizePerPage ? { ...page, items: shuffleMetas(page.items) } : page;
+  }
   const held = memberCursors.get(cursorKey);
 
   let sourceIndex = 0;
@@ -266,7 +346,7 @@ export async function boxSetMembers(
     let passed = 0;
     while (sourceIndex < sources.length) {
       const { catalog } = sources[sourceIndex];
-      const known = knownCatalogLength(userUUID, catalog, extrasOf(sources[sourceIndex]), tags, includeItemTypes ?? '');
+      const known = knownCatalogLength(userUUID, catalog, extrasOf(sources[sourceIndex]), tags, filterKey);
       if (known === undefined || passed + known > startIndex) break;
       passed += known;
       sourceIndex += 1;
@@ -279,12 +359,18 @@ export async function boxSetMembers(
 
   while (sourceIndex < sources.length && collected.length < limit) {
     const { catalog } = sources[sourceIndex];
+    if (catalogCannotServe(catalog, includeItemTypes)) {
+      sourceIndex += 1;
+      from = 0;
+      continue;
+    }
     const extras = extrasOf(sources[sourceIndex]);
-    const keep = includeTypesFilter(catalog.type, includeItemTypes);
+    const keep = includeTypesFilter(catalog.type, includeItemTypes, officialRatings);
     const landscape = isLandscapeCatalog(config, catalog);
-    const page = await fetchWindow(userUUID, catalog, from, toSkip + limit - collected.length, extras, keep, tags, includeItemTypes ?? '')
+    const page = await fetchWindow(userUUID, catalog, from, toSkip + limit - collected.length, extras, keep, tags, filterKey)
       .catch(() => ({ items: [] as any[], hasMore: false }));
 
+    const served: any[] = [];
     for (const meta of page.items) {
       if (!meta?.id || seen.has(String(meta.id))) continue;
       seen.add(String(meta.id));
@@ -292,6 +378,9 @@ export async function boxSetMembers(
         toSkip -= 1;
         continue;
       }
+      served.push(meta);
+    }
+    for (const meta of servedOrder(served, page)) {
       const item = metaToBaseItem(meta, catalog.type, serverId, parentId);
       if (landscape) showLandscape([item]);
       collected.push(item);
@@ -312,5 +401,121 @@ export async function boxSetMembers(
     memberCursors.delete(cursorKey);
   }
 
+  return { items: folder.randomizePerPage ? shuffleMetas(collected) : collected, hasMore: more };
+}
+
+// Where a mixed walk stopped: each source's position, whose turn is next, and
+// for alternating how much of that source's page is still to come.
+interface MixCursor {
+  nextIndex: number;
+  offsets: number[];
+  done: boolean[];
+  turn: number;
+  runLeft: number;
+  seen: Set<string>;
+}
+
+const mixCursors = new LRUCache<string, MixCursor>({
+  max: 50,
+  ttl: envInt('JELLYFIN_FOLDER_CURSOR_TTL', 600, 30) * 1000,
+});
+
+/** Several sources taken in turn: one title each when interleaved, one page each when alternating. */
+async function mixedMembers(args: {
+  userUUID: string;
+  config: any;
+  serverId: string;
+  parentId: string;
+  sources: Array<{ source: SourceDraft; catalog: CatalogRef; genre: string | null }>;
+  mode: Exclude<MergeMode, 'sequential'>;
+  startIndex: number;
+  limit: number;
+  includeItemTypes?: string;
+  officialRatings?: string;
+  tags: string[];
+  filterKey: string;
+  cursorKey: string;
+}): Promise<MembersPage> {
+  const { userUUID, config, serverId, parentId, sources, mode, startIndex, limit, includeItemTypes, officialRatings, tags, filterKey, cursorKey } = args;
+  const count = sources.length;
+  const extrasOf = (i: number): Record<string, string> => (sources[i].genre ? { genre: sources[i].genre as string } : {});
+  const held = mixCursors.get(cursorKey);
+  const resumed = held && held.nextIndex === startIndex ? held : null;
+  const offsets = resumed ? [...resumed.offsets] : sources.map(() => 0);
+  const done = resumed ? [...resumed.done] : sources.map(({ catalog }) => catalogCannotServe(catalog, includeItemTypes));
+  const seen = new Set<string>(resumed?.seen);
+  let turn = resumed?.turn ?? 0;
+  // -1 starts a source's page, measured once its first window has been read.
+  let runLeft = resumed?.runLeft ?? -1;
+  // A window placed by count is rebuilt from the start, since repeats shift every later position.
+  let toSkip = resumed ? 0 : startIndex;
+
+  const buffers: any[][] = sources.map(() => []);
+  const ended = sources.map(() => false);
+  const chunk = Math.max(10, Math.ceil((toSkip + limit) / count));
+
+  // Positions count every title a source handed over, repeats too, so the next window starts where this one stopped.
+  const fill = async (i: number): Promise<void> => {
+    if (buffers[i].length || ended[i] || done[i]) return;
+    const { catalog } = sources[i];
+    const keep = includeTypesFilter(catalog.type, includeItemTypes, officialRatings);
+    const window = await fetchWindow(userUUID, catalog, offsets[i], chunk, extrasOf(i), keep, tags, filterKey)
+      .catch(() => ({ items: [] as any[], hasMore: false }));
+    buffers[i] = servedOrder(window.items, window);
+    if (!window.hasMore) ended[i] = true;
+  };
+  const take = async (i: number): Promise<any | undefined> => {
+    await fill(i);
+    if (!buffers[i].length) {
+      done[i] = true;
+      return undefined;
+    }
+    offsets[i] += 1;
+    return buffers[i].shift();
+  };
+  if (mode === 'interleaved') await Promise.all(sources.map((_, i) => fill(i)));
+  const pass = () => {
+    turn = (turn + 1) % count;
+    runLeft = -1;
+  };
+
+  const collected: any[] = [];
+  let nextIndex = startIndex;
+  while (collected.length < limit && done.some((d) => !d)) {
+    const i = turn % count;
+    if (done[i]) {
+      pass();
+      continue;
+    }
+    const meta = await take(i);
+    if (meta === undefined) {
+      pass();
+      continue;
+    }
+    if (mode === 'interleaved') pass();
+    else {
+      if (runLeft < 0) runLeft = knownPageLength(userUUID, sources[i].catalog, extrasOf(i), tags) ?? (parseInt(process.env.CATALOG_LIST_ITEMS_SIZE as string) || 20);
+      runLeft -= 1;
+      if (runLeft <= 0) pass();
+    }
+    if (!meta?.id || seen.has(String(meta.id))) continue;
+    seen.add(String(meta.id));
+    if (toSkip > 0) {
+      toSkip -= 1;
+      continue;
+    }
+    const item = metaToBaseItem(meta, sources[i].catalog.type, serverId, parentId);
+    if (isLandscapeCatalog(config, sources[i].catalog)) showLandscape([item]);
+    collected.push(item);
+    nextIndex += 1;
+  }
+
+  const finished = sources.map((_, i) => done[i] || (ended[i] && buffers[i].length === 0));
+  const more = finished.some((f) => !f);
+  if (more && collected.length > 0 && seen.size <= MEMBER_CURSOR_MAX_IDS) {
+    mixCursors.set(cursorKey, { nextIndex, offsets, done: finished, turn, runLeft, seen });
+  } else {
+    mixCursors.delete(cursorKey);
+  }
   return { items: collected, hasMore: more };
 }

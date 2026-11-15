@@ -29,8 +29,10 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { getTagColor } from '@/lib/tagColors';
 import { catalogKey, type ManifestCatalog } from '@/lib/collectionBuilder/manifestSources';
-import { aliasHint, TERMS, type Target } from '@/lib/collectionBuilder/terms';
+import { TERMS, type Target } from '@/lib/collectionBuilder/terms';
 import { folderSources, hasNuvioFolderArt, subFolders, type FolderDraft, type SourceDraft } from '@shared/types';
+import { FOLDER_MERGE_MODE, mergeModeOf } from '@shared/mergeModes';
+import { MergeModePicker } from '@/components/MergeModePicker';
 
 import { ImageUrlField } from './ImageUrlField';
 import { ScopeChip } from './ScopeChip';
@@ -156,9 +158,6 @@ export function FolderCard({
         <div className="space-y-2">
           <div className="flex flex-wrap items-baseline gap-2">
             <Label id={`${uid}-shape`} className="text-sm font-medium">{terms.shape}</Label>
-            {aliasHint('shape') && (
-              <span className="text-xs text-muted-foreground">{aliasHint('shape')}</span>
-            )}
           </div>
           <div role="group" aria-labelledby={`${uid}-shape`} className="flex gap-1 rounded-xl bg-white/[0.03] p-1">
             {SHAPE_ORDER.map(shape => {
@@ -191,6 +190,22 @@ export function FolderCard({
           hint="preview follows the tile shape above"
           onChange={next => update({ coverImageUrl: next })}
         />
+        {target === 'jellyfin' && (
+          <>
+            <ImageUrlField
+              label="Hero backdrop URL"
+              value={folder.heroBackdropUrl || ''}
+              aspect="wide"
+              onChange={next => update({ heroBackdropUrl: next })}
+            />
+            <ImageUrlField
+              label="Title logo URL"
+              value={folder.titleLogoUrl || ''}
+              aspect="logo"
+              onChange={next => update({ titleLogoUrl: next })}
+            />
+          </>
+        )}
       </div>
 
       <div className="flex items-center gap-2">
@@ -235,14 +250,14 @@ export function FolderCard({
             </div>
           )}
           <p className="text-xs text-muted-foreground">
-            Jellyfin clients open these as folders within this one. Fusion and Nuvio have no nested folders, so there the catalogs inside them are exported as this folder's own.
+            Jellyfin clients open these as folders within this one. Nuvio has no nested folders, so there the catalogs inside them are exported as this folder's own.
           </p>
         </div>
       )}
 
       <div className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <Label className="text-sm font-medium" title={aliasHint('sources') ?? undefined}>{terms.sources}</Label>
+          <Label className="text-sm font-medium">{terms.sources}</Label>
           <div className="flex flex-wrap items-center gap-1.5">
             {tagOptions.length > 0 && (
               <DropdownMenu>
@@ -324,6 +339,31 @@ export function FolderCard({
             </div>
           </SortableContext>
         </DndContext>
+        {folder.sources.length > 1 && (
+          <div className="space-y-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Label id={`${uid}-merge`} className="text-sm font-medium">Combine these catalogs</Label>
+              <ScopeChip scope="jellyfin" />
+            </div>
+            <MergeModePicker
+              value={mergeModeOf(folder.mergeMode, FOLDER_MERGE_MODE)}
+              onChange={mergeMode => update({ mergeMode })}
+              labelledBy={`${uid}-merge`}
+              className="flex flex-col gap-2 @md:flex-row"
+            />
+            <div className="flex items-center gap-2">
+              <Switch
+                id={`${uid}-randomize`}
+                checked={Boolean(folder.randomizePerPage)}
+                onCheckedChange={value => update({ randomizePerPage: value })}
+              />
+              <Label htmlFor={`${uid}-randomize`} className="text-sm font-medium">Randomize order</Label>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              A title in two catalogs shows once. Nuvio and Fusion get the catalogs as a list and combine them their own way.
+            </p>
+          </div>
+        )}
       </div>
 
       {nuvioArtVisible && (
@@ -334,7 +374,7 @@ export function FolderCard({
         >
           <Tv className="h-3.5 w-3.5" />
           {showExtras ? 'Hide' : 'Show'} Nuvio artwork
-          {target === 'fusion' && <ScopeChip scope="nuvio" />}
+          {target === 'jellyfin' && <ScopeChip scope="nuvio" />}
         </button>
       )}
       {nuvioArtVisible && showExtras && (
@@ -354,12 +394,14 @@ export function FolderCard({
             aspect={ASPECT_BY_TILE[folder.shape]}
             onChange={next => update({ focusGifUrl: next })}
           />
-          <ImageUrlField
-            label="Hero backdrop URL"
-            value={folder.heroBackdropUrl || ''}
-            aspect="wide"
-            onChange={next => update({ heroBackdropUrl: next })}
-          />
+          {target === 'nuvio' && (
+            <ImageUrlField
+              label="Hero backdrop URL"
+              value={folder.heroBackdropUrl || ''}
+              aspect="wide"
+              onChange={next => update({ heroBackdropUrl: next })}
+            />
+          )}
           <div className="space-y-1.5">
             <Label htmlFor={`${uid}-hero-video`} className="text-sm font-medium">Hero video URL</Label>
             <Input
@@ -370,12 +412,14 @@ export function FolderCard({
               className="h-9"
             />
           </div>
-          <ImageUrlField
-            label="Title logo URL"
-            value={folder.titleLogoUrl || ''}
-            aspect="logo"
-            onChange={next => update({ titleLogoUrl: next })}
-          />
+          {target === 'nuvio' && (
+            <ImageUrlField
+              label="Title logo URL"
+              value={folder.titleLogoUrl || ''}
+              aspect="logo"
+              onChange={next => update({ titleLogoUrl: next })}
+            />
+          )}
           <div className="flex items-center gap-2 pt-6">
             <Switch
               id={`${uid}-focus-gif`}
